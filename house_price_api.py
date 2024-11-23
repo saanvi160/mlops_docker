@@ -1,91 +1,88 @@
-import pandas as pd
-from sklearn.model_selection import train_test_split
-from sklearn.linear_model import LinearRegression
-from sklearn.impute import SimpleImputer
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-import joblib
+import pandas as pd
+import numpy as np
+from sklearn.linear_model import LinearRegression
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
 
-# FastAPI initialization
 app = FastAPI()
 
-# Define input model for FastAPI
-class HousePriceRequest(BaseModel):
-    features: dict
+class HouseFeatures(BaseModel):
+    square_feet: float  # GrLivArea
+    bedrooms: int      # BedroomAbvGr
+    bathrooms: float   # combining FullBath and HalfBath
+    year_built: int    # YearBuilt
 
 class HousePricePredictor:
-    def __init__(self, dataset_path: str):
-        self.dataset_path = dataset_path
+    def __init__(self):
         self.model = LinearRegression()
-        self.imputer = SimpleImputer(strategy='mean')  # Imputer for numeric data
-        self.cat_imputer = SimpleImputer(strategy='most_frequent')  # Imputer for categorical data
-        self.df = pd.read_csv("/app/train.csv")
-        self.train_model()  # Train model when the app starts
-
-    def load_and_prepare_data(self):
-        # Separate numeric and categorical columns
-        numeric_cols = self.df.select_dtypes(include=['number']).columns
-        categorical_cols = self.df.select_dtypes(include=['object']).columns
-
-        # Impute missing values for numeric columns with mean strategy
-        self.df[numeric_cols] = self.imputer.fit_transform(self.df[numeric_cols])
-
-        # Impute missing values for categorical columns with most frequent strategy
-        self.df[categorical_cols] = self.cat_imputer.fit_transform(self.df[categorical_cols])
-
-        # One-hot encode categorical features
-        self.df = pd.get_dummies(self.df, drop_first=True)
-
-        # Features and target variable
-        X = self.df.drop(columns='SalePrice')  # Assuming 'SalePrice' is the target column
-        y = self.df['SalePrice']
+        self.scaler = StandardScaler()
+        self.feature_columns = ['square_feet', 'bedrooms', 'bathrooms', 'year_built']
         
-        return X, y
-
-    def train_model(self):
-        X, y = self.load_and_prepare_data()
-        # Train a linear regression model
-        self.model.fit(X, y)
-        joblib.dump(self.model, 'house_price_model.pkl')  # Save the trained model
-        joblib.dump(self.imputer, 'numeric_imputer.pkl')  # Save the imputer for numeric data
-        joblib.dump(self.cat_imputer, 'categorical_imputer.pkl')  # Save the imputer for categorical data
-
-    def predict(self, input_data: dict):
-        # Preprocess and impute input data as per the training set
-        input_df = pd.DataFrame([input_data])
-        numeric_cols = input_df.select_dtypes(include=['number']).columns
-        categorical_cols = input_df.select_dtypes(include=['object']).columns
+    def preprocess_data(self, data: pd.DataFrame) -> pd.DataFrame:
+        return self.scaler.fit_transform(data)
+    
+    def train(self, X: pd.DataFrame, y: pd.Series):
+        X_processed = self.preprocess_data(X)
+        self.model.fit(X_processed, y)
         
-        input_df[numeric_cols] = self.imputer.transform(input_df[numeric_cols])
-        input_df[categorical_cols] = self.cat_imputer.transform(input_df[categorical_cols])
+    def predict(self, features: pd.DataFrame) -> float:
+        features_processed = self.scaler.transform(features)
+        return self.model.predict(features_processed)[0]
 
-        # One-hot encode the input data in the same way as the training data
-        input_df = pd.get_dummies(input_df, drop_first=True)
+# Load and prepare the data
+def prepare_training_data():
+    # Load the training data
+    df = pd.read_csv('train.csv')
+    
+    # Prepare features
+    X = pd.DataFrame({
+        'square_feet': df['GrLivArea'],
+        'bedrooms': df['BedroomAbvGr'],
+        'bathrooms': df['FullBath'] + 0.5 * df.get('HalfBath', 0),  # Convert half baths to equivalent full baths
+        'year_built': df['YearBuilt']
+    })
+    
+    # Target variable
+    y = df['SalePrice']
+    
+    return X, y
 
-        # Align the columns of input_df with the trained model's feature space
-        X_train, _ = self.load_and_prepare_data()  # Get training data to align columns
-        input_df = input_df.reindex(columns=X_train.columns, fill_value=0)
+# Initialize predictor
+predictor = HousePricePredictor()
 
-        # Load the trained model and predict
-        model = joblib.load('house_price_model.pkl')
-        prediction = model.predict(input_df)
-        return prediction[0]
+# Load and train the model
+try:
+    X, y = prepare_training_data()
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    predictor.train(X_train, y_train)
+    print("Model trained successfully!")
+except Exception as e:
+    print(f"Error loading or training model: {str(e)}")
 
-# Initialize the predictor
-predictor = HousePricePredictor(dataset_path="C:/Users/Admin/OneDrive/Desktop/python_mlops/train.csv")
-
-# FastAPI endpoint for prediction
-@app.post("/predict/")
-async def predict(data: dict):
+@app.post("/predict")
+async def predict_price(features: HouseFeatures):
     try:
-        # Extract features from the request
-        features = data.get('features', {})
-        # Predict using the model
-        prediction = predictor.predict(features)
-        return {"prediction": prediction}
+        # Convert input features to DataFrame
+        input_data = pd.DataFrame([[
+            features.square_feet,
+            features.bedrooms,
+            features.bathrooms,
+            features.year_built
+        ]], columns=predictor.feature_columns)
+        
+        # Make prediction
+        predicted_price = predictor.predict(input_data)
+        
+        return {
+            "predicted_price": round(predicted_price, 2)
+        }
+    
     except Exception as e:
-        return {"error": str(e)}
+        raise HTTPException(status_code=400, detail=str(e))
 
 @app.get("/")
 def read_root():
+    print("Root endpoint accessed")  # Debugging line
     return {"message": "Welcome to House Price Predictor API"}
